@@ -13,12 +13,18 @@
 # limitations under the License.
 """PyTorch GLM-4-MOE model."""
 
+from dataclasses import dataclass
+
 import torch
 from torch import nn
 
+from ...cache_utils import Cache
 from ...configuration_utils import PreTrainedConfig
+from ...masking_utils import create_causal_mask
+from ...modeling_outputs import BaseModelOutputWithPast, ModelOutput
 from ...modeling_rope_utils import RopeParameters
-from ...utils import logging
+from ...processing_utils import Unpack
+from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
 from ..cohere.modeling_cohere import CohereAttention
 from ..deepseek_v3.modeling_deepseek_v3 import (
     DeepseekV3DecoderLayer,
@@ -104,6 +110,10 @@ class Glm4MoeConfig(PreTrainedConfig):
         first_k_dense_replace (`int`, *optional*, defaults to 1):
             Number of dense layers in shallow layers(embed->dense->dense->...->dense->moe->moe...->lm_head).
                                                             \--k dense layers--/
+        num_nextn_predict_layers (`int`, *optional*, defaults to 1):
+            Number of MTP layers stacked after the base decoder.
+        mtp_lambda_weight (`float`, *optional*, defaults to 0.3):
+            Weight used for MTP loss during training.
         norm_topk_prob (`bool`, *optional*, defaults to `True`):
             Whether to normalize the topk probabilities.
         use_qk_norm (`bool`, *optional*, defaults to `False`):
@@ -177,6 +187,8 @@ class Glm4MoeConfig(PreTrainedConfig):
         n_group: int | None = 1,
         topk_group: int | None = 1,
         first_k_dense_replace: int | None = 1,
+        num_nextn_predict_layers: int | None = 1,
+        mtp_lambda_weight: float | None = 0.3,
         norm_topk_prob: bool | None = True,
         use_qk_norm: bool | None = False,
         bos_token_id: int | None = None,
@@ -210,6 +222,8 @@ class Glm4MoeConfig(PreTrainedConfig):
         self.n_routed_experts = n_routed_experts
         self.routed_scaling_factor = routed_scaling_factor
         self.first_k_dense_replace = first_k_dense_replace
+        self.num_nextn_predict_layers = num_nextn_predict_layers
+        self.mtp_lambda_weight = mtp_lambda_weight
         self.norm_topk_prob = norm_topk_prob
         self.use_qk_norm = use_qk_norm
         self.tie_word_embeddings = tie_word_embeddings
@@ -279,20 +293,258 @@ class Glm4MoeDecoderLayer(DeepseekV3DecoderLayer):
     pass
 
 
+class Glm4MoeSharedHead(nn.Module):
+    def __init__(self, config: Glm4MoeConfig):
+        super().__init__()
+        self.norm = Glm4MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.head(self.norm(hidden_states))
+
+
+class Glm4MoeMultiTokenPredictorLayer(Glm4MoeDecoderLayer):
+    def __init__(self, config: Glm4MoeConfig, layer_idx: int):
+        super().__init__(config, layer_idx)
+        self.enorm = Glm4MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = Glm4MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        self.shared_head = Glm4MoeSharedHead(config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.LongTensor,
+        embed_tokens: nn.Embedding,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        input_embeds = embed_tokens(input_ids)
+        if hidden_states.shape[:2] != input_embeds.shape[:2]:
+            raise ValueError("MTP hidden states and shifted inputs must have matching sequence shapes.")
+
+        hidden_states = self.eh_proj(torch.cat((self.enorm(input_embeds), self.hnorm(hidden_states)), dim=-1))
+        hidden_states = super().forward(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        logits = self.shared_head(hidden_states)
+        return hidden_states, logits
+
+
 class Glm4MoePreTrainedModel(DeepseekV3PreTrainedModel):
-    _keys_to_ignore_on_load_unexpected = [r"model\.layers\.92.*", r"model\.layers\.46.*"]
+    _keys_to_ignore_on_load_missing = [r"model\.layers\.\d+\.shared_head\.head\..*"]
 
 
 class Glm4MoeModel(DeepseekV3Model):
-    pass
+    def __init__(self, config: Glm4MoeConfig):
+        super().__init__(config)
+        self.layers.extend(
+            [
+                Glm4MoeMultiTokenPredictorLayer(config, layer_idx)
+                for layer_idx in range(
+                    config.num_hidden_layers, config.num_hidden_layers + config.num_nextn_predict_layers
+                )
+            ]
+        )
+
+    def forward_mtp(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple[torch.Tensor, ...]:
+        if self.config.num_nextn_predict_layers == 0 or hidden_states.shape[1] <= 1:
+            return ()
+
+        hidden_states = hidden_states[:, :-1]
+        mtp_logits = []
+        num_nextn_predict_tokens = min(input_ids.shape[1] - 1, self.config.num_nextn_predict_layers)
+        for mtp_idx in range(num_nextn_predict_tokens):
+            shifted_input_ids = input_ids[:, mtp_idx + 1 :]
+            if shifted_input_ids.shape[1] == 0:
+                break
+
+            if position_ids is None:
+                shifted_position_ids = torch.arange(
+                    shifted_input_ids.shape[1], device=shifted_input_ids.device, dtype=torch.long
+                )
+                shifted_position_ids = shifted_position_ids.unsqueeze(0).expand(shifted_input_ids.shape[0], -1)
+            else:
+                shifted_position_ids = position_ids[:, mtp_idx + 1 :]
+
+            if cache_position is None:
+                shifted_cache_position = torch.arange(
+                    shifted_input_ids.shape[1], device=shifted_input_ids.device, dtype=torch.long
+                )
+            else:
+                shifted_cache_position = cache_position[mtp_idx + 1 :]
+
+            shifted_attention_mask = attention_mask[:, mtp_idx + 1 :] if attention_mask is not None else None
+            shifted_inputs_embeds = self.embed_tokens(shifted_input_ids)
+            shifted_causal_mask = create_causal_mask(
+                config=self.config,
+                inputs_embeds=shifted_inputs_embeds,
+                attention_mask=shifted_attention_mask,
+                cache_position=shifted_cache_position,
+                past_key_values=None,
+                position_ids=shifted_position_ids,
+            )
+            shifted_position_embeddings = self.rotary_emb(hidden_states, shifted_position_ids)
+
+            mtp_layer = self.layers[self.config.num_hidden_layers + mtp_idx]
+            hidden_states, logits = mtp_layer(
+                hidden_states=hidden_states,
+                input_ids=shifted_input_ids,
+                embed_tokens=self.embed_tokens,
+                attention_mask=shifted_causal_mask,
+                position_ids=shifted_position_ids,
+                use_cache=False,
+                cache_position=shifted_cache_position,
+                position_embeddings=shifted_position_embeddings,
+                **kwargs,
+            )
+            mtp_logits.append(logits)
+            hidden_states = hidden_states[:, :-1]
+            if hidden_states.shape[1] <= 1:
+                break
+
+        return tuple(mtp_logits)
+
+
+@dataclass
+@auto_docstring(
+    custom_intro="""
+    Base class for GLM-4-MoE causal language model (or autoregressive) outputs with optional MTP logits.
+    """
+)
+class Glm4MoeCausalLMOutputWithPast(ModelOutput):
+    r"""
+    loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+        Language modeling loss (for next-token prediction).
+    logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+        Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+    past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+        It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
+
+        Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
+        `past_key_values` input) to speed up sequential decoding.
+    mtp_logits (`tuple(torch.FloatTensor)`, *optional*):
+        Prediction scores from MTP layers. Each tensor has shape
+        `(batch_size, sequence_length - i - 1, config.vocab_size)` for the i-th MTP layer.
+    """
+
+    loss: torch.FloatTensor | None = None
+    logits: torch.FloatTensor | None = None
+    past_key_values: Cache | None = None
+    hidden_states: tuple[torch.FloatTensor, ...] | None = None
+    attentions: tuple[torch.FloatTensor, ...] | None = None
+    mtp_logits: tuple[torch.FloatTensor, ...] | None = None
 
 
 class Glm4MoeForCausalLM(DeepseekV3ForCausalLM):
-    pass
+    @can_return_tuple
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        output_mtp_logits: bool = False,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> Glm4MoeCausalLMOutputWithPast:
+        r"""
+        output_mtp_logits (`bool`, *optional*, defaults to `False`):
+            Whether to return logits produced by MTP layers.
+        """
+        outputs: BaseModelOutputWithPast = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+        hidden_states = outputs.last_hidden_state
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        mtp_logits = None
+        should_compute_mtp = (
+            self.config.num_nextn_predict_layers > 0
+            and input_ids is not None
+            and hidden_states.shape[1] > 1
+            and past_key_values is None
+            and (output_mtp_logits or labels is not None)
+        )
+        if should_compute_mtp:
+            mtp_logits = self.model.forward_mtp(
+                hidden_states=hidden_states,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            if mtp_logits is not None and len(mtp_logits) > 0:
+                mtp_losses = []
+                for mtp_idx, mtp_layer_logits in enumerate(mtp_logits):
+                    shifted_labels = labels[:, mtp_idx + 1 :]
+                    if shifted_labels.shape[1] <= 1:
+                        continue
+                    mtp_losses.append(
+                        self.loss_function(
+                            logits=mtp_layer_logits, labels=shifted_labels, vocab_size=self.config.vocab_size, **kwargs
+                        )
+                    )
+                if len(mtp_losses) > 0:
+                    mtp_loss = torch.stack(mtp_losses).mean()
+                    loss = loss + self.config.mtp_lambda_weight * mtp_loss
+
+        if not output_mtp_logits:
+            mtp_logits = None
+
+        return Glm4MoeCausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            mtp_logits=mtp_logits,
+        )
 
 
 __all__ = [
     "Glm4MoeConfig",
+    "Glm4MoeCausalLMOutputWithPast",
     "Glm4MoePreTrainedModel",
     "Glm4MoeModel",
     "Glm4MoeForCausalLM",

@@ -21,6 +21,7 @@
 
 import math
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -35,7 +36,7 @@ from ...integrations import use_experts_implementation, use_kernel_forward_from_
 from ...masking_utils import create_causal_mask
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_layers import GradientCheckpointingLayer
-from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from ...modeling_outputs import BaseModelOutputWithPast, ModelOutput
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
@@ -555,6 +556,7 @@ class GlmMoeDsaPreTrainedModel(PreTrainedModel):
     }
     _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
     _keys_to_ignore_on_load_unexpected = [r"model\.layers\.78.*"]
+    _keys_to_ignore_on_load_missing = [r"model\.layers\.\d+\.shared_head\.head\..*"]
 
     @torch.no_grad()
     def _init_weights(self, module):
@@ -634,6 +636,56 @@ class GlmMoeDsaRotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+class GlmMoeDsaSharedHead(nn.Module):
+    def __init__(self, config: GlmMoeDsaConfig):
+        super().__init__()
+        self.norm = GlmMoeDsaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.head(self.norm(hidden_states))
+
+
+class GlmMoeDsaMultiTokenPredictorLayer(GlmMoeDsaDecoderLayer):
+    def __init__(self, config: GlmMoeDsaConfig, layer_idx: int):
+        super().__init__(config, layer_idx)
+        self.enorm = GlmMoeDsaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = GlmMoeDsaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        self.shared_head = GlmMoeDsaSharedHead(config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.LongTensor,
+        embed_tokens: nn.Embedding,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        input_embeds = embed_tokens(input_ids)
+        if hidden_states.shape[:2] != input_embeds.shape[:2]:
+            raise ValueError("MTP hidden states and shifted inputs must have matching sequence shapes.")
+
+        hidden_states = self.eh_proj(torch.cat((self.enorm(input_embeds), self.hnorm(hidden_states)), dim=-1))
+        hidden_states = super().forward(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        logits = self.shared_head(hidden_states)
+        return hidden_states, logits
+
+
 @auto_docstring
 class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
     def __init__(self, config: GlmMoeDsaConfig):
@@ -648,6 +700,14 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
         self.norm = GlmMoeDsaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = GlmMoeDsaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
+        self.layers.extend(
+            [
+                GlmMoeDsaMultiTokenPredictorLayer(config, layer_idx)
+                for layer_idx in range(
+                    config.num_hidden_layers, config.num_hidden_layers + config.num_nextn_predict_layers
+                )
+            ]
+        )
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -714,6 +774,102 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
             past_key_values=past_key_values,
         )
 
+    def forward_mtp(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple[torch.Tensor, ...]:
+        if self.config.num_nextn_predict_layers == 0 or hidden_states.shape[1] <= 1:
+            return ()
+
+        hidden_states = hidden_states[:, :-1]
+        mtp_logits = []
+        num_nextn_predict_tokens = min(input_ids.shape[1] - 1, self.config.num_nextn_predict_layers)
+        for mtp_idx in range(num_nextn_predict_tokens):
+            shifted_input_ids = input_ids[:, mtp_idx + 1 :]
+            if shifted_input_ids.shape[1] == 0:
+                break
+
+            if position_ids is None:
+                shifted_position_ids = torch.arange(
+                    shifted_input_ids.shape[1], device=shifted_input_ids.device, dtype=torch.long
+                )
+                shifted_position_ids = shifted_position_ids.unsqueeze(0).expand(shifted_input_ids.shape[0], -1)
+            else:
+                shifted_position_ids = position_ids[:, mtp_idx + 1 :]
+
+            if cache_position is None:
+                shifted_cache_position = torch.arange(
+                    shifted_input_ids.shape[1], device=shifted_input_ids.device, dtype=torch.long
+                )
+            else:
+                shifted_cache_position = cache_position[mtp_idx + 1 :]
+
+            shifted_attention_mask = attention_mask[:, mtp_idx + 1 :] if attention_mask is not None else None
+            shifted_inputs_embeds = self.embed_tokens(shifted_input_ids)
+            shifted_causal_mask = create_causal_mask(
+                config=self.config,
+                inputs_embeds=shifted_inputs_embeds,
+                attention_mask=shifted_attention_mask,
+                cache_position=shifted_cache_position,
+                past_key_values=None,
+                position_ids=shifted_position_ids,
+            )
+            shifted_position_embeddings = self.rotary_emb(hidden_states, shifted_position_ids)
+
+            mtp_layer = self.layers[self.config.num_hidden_layers + mtp_idx]
+            hidden_states, logits = mtp_layer(
+                hidden_states=hidden_states,
+                input_ids=shifted_input_ids,
+                embed_tokens=self.embed_tokens,
+                attention_mask=shifted_causal_mask,
+                position_ids=shifted_position_ids,
+                use_cache=False,
+                cache_position=shifted_cache_position,
+                position_embeddings=shifted_position_embeddings,
+                **kwargs,
+            )
+            mtp_logits.append(logits)
+            hidden_states = hidden_states[:, :-1]
+            if hidden_states.shape[1] <= 1:
+                break
+
+        return tuple(mtp_logits)
+
+
+@dataclass
+@auto_docstring(
+    custom_intro="""
+    Base class for GLM-4-MoE causal language model (or autoregressive) outputs with optional MTP logits.
+    """
+)
+class GlmMoeDsaCausalLMOutputWithPast(ModelOutput):
+    r"""
+    loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+        Language modeling loss (for next-token prediction).
+    logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+        Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+    past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+        It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
+
+        Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
+        `past_key_values` input) to speed up sequential decoding.
+    mtp_logits (`tuple(torch.FloatTensor)`, *optional*):
+        Prediction scores from MTP layers. Each tensor has shape
+        `(batch_size, sequence_length - i - 1, config.vocab_size)` for the i-th MTP layer.
+    """
+
+    loss: torch.FloatTensor | None = None
+    logits: torch.FloatTensor | None = None
+    past_key_values: Cache | None = None
+    hidden_states: tuple[torch.FloatTensor, ...] | None = None
+    attentions: tuple[torch.FloatTensor, ...] | None = None
+    mtp_logits: tuple[torch.FloatTensor, ...] | None = None
+
 
 @auto_docstring
 class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
@@ -743,25 +899,13 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
         use_cache: bool | None = None,
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
+        output_mtp_logits: bool = False,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> CausalLMOutputWithPast:
+    ) -> GlmMoeDsaCausalLMOutputWithPast:
         r"""
-        Example:
-
-        ```python
-        >>> from transformers import AutoTokenizer, GlmMoeDsaForCausalLM
-
-        >>> model = GlmMoeDsaForCausalLM.from_pretrained("meta-glm_moe_dsa/GlmMoeDsa-2-7b-hf")
-        >>> tokenizer = AutoTokenizer.from_pretrained("meta-glm_moe_dsa/GlmMoeDsa-2-7b-hf")
-
-        >>> prompt = "Hey, are you conscious? Can you talk to me?"
-        >>> inputs = tokenizer(prompt, return_tensors="pt")
-
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
-        ```"""
+        output_mtp_logits (`bool`, *optional*, defaults to `False`):
+            Whether to return logits produced by MTP layers.
+        """
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -778,16 +922,52 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
+        mtp_logits = None
+        should_compute_mtp = (
+            self.config.num_nextn_predict_layers > 0
+            and input_ids is not None
+            and hidden_states.shape[1] > 1
+            and past_key_values is None
+            and (output_mtp_logits or labels is not None)
+        )
+        if should_compute_mtp:
+            mtp_logits = self.model.forward_mtp(
+                hidden_states=hidden_states,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            if mtp_logits is not None and len(mtp_logits) > 0:
+                mtp_losses = []
+                for mtp_idx, mtp_layer_logits in enumerate(mtp_logits):
+                    shifted_labels = labels[:, mtp_idx + 1 :]
+                    if shifted_labels.shape[1] <= 1:
+                        continue
+                    mtp_losses.append(
+                        self.loss_function(
+                            logits=mtp_layer_logits, labels=shifted_labels, vocab_size=self.config.vocab_size, **kwargs
+                        )
+                    )
+                if len(mtp_losses) > 0:
+                    mtp_loss = torch.stack(mtp_losses).mean()
+                    loss = loss + self.config.mtp_lambda_weight * mtp_loss
 
-        return CausalLMOutputWithPast(
+        if not output_mtp_logits:
+            mtp_logits = None
+
+        return GlmMoeDsaCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            mtp_logits=mtp_logits,
         )
 
 

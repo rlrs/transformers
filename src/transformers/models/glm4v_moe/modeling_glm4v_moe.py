@@ -422,7 +422,8 @@ class Glm4vMoePreTrainedModel(PreTrainedModel):
         "router_logits": Glm4vMoeTextTopkRouter,
     }
     _keep_in_fp32_modules_strict = ["e_score_correction_bias"]
-    _keys_to_ignore_on_load_unexpected = [r"model\.layers\.92.*", r"model\.layers\.46.*"]
+    _keys_to_ignore_on_load_unexpected = [r"model\.layers\.61.*"]
+    _keys_to_ignore_on_load_missing = [r"model\.layers\.\d+\.shared_head\.head\..*"]
     input_modalities = ("text", "image", "video")
 
     @torch.no_grad()

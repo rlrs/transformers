@@ -80,6 +80,10 @@ class SolarOpenConfig(PreTrainedConfig):
             Number of groups for routed experts.
         topk_group (`int`, *optional*, defaults to 1):
             Number of selected groups for each token.
+        num_nextn_predict_layers (`int`, *optional*, defaults to 0):
+            Number of MTP layers stacked after the base decoder.
+        mtp_lambda_weight (`float`, *optional*, defaults to 0.3):
+            Weight used for MTP loss during training.
         norm_topk_prob (`bool`, *optional*, defaults to `True`):
             Whether to normalize the topk probabilities.
         bos_token_id (`int`, *optional*):
@@ -137,6 +141,8 @@ class SolarOpenConfig(PreTrainedConfig):
         routed_scaling_factor: float = 1.0,
         n_group: int = 1,
         topk_group: int = 1,
+        num_nextn_predict_layers: int = 0,
+        mtp_lambda_weight: float = 0.3,
         norm_topk_prob: bool = True,
         bos_token_id: int | None = None,
         eos_token_id: int | None = None,
@@ -172,6 +178,8 @@ class SolarOpenConfig(PreTrainedConfig):
         self.n_shared_experts = n_shared_experts
         self.n_routed_experts = n_routed_experts
         self.routed_scaling_factor = routed_scaling_factor
+        self.num_nextn_predict_layers = num_nextn_predict_layers
+        self.mtp_lambda_weight = mtp_lambda_weight
         self.norm_topk_prob = norm_topk_prob
         self.tie_word_embeddings = tie_word_embeddings
         self.bos_token_id = bos_token_id

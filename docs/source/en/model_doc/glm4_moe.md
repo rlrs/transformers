@@ -19,7 +19,7 @@ rendered properly in your Markdown viewer.
 
 ## Overview
 
-**GLM-4.7**, **GLM-4.6** and **GLM-4.5** language model use this class. The implementation in transformers does not include an MTP layer.
+**GLM-4.7**, **GLM-4.6** and **GLM-4.5** language model use this class. The implementation in transformers includes the MTP layer used by these checkpoints.
 
 ### GLM-4.7
 

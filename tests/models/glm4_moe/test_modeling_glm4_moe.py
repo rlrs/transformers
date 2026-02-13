@@ -31,7 +31,7 @@ from ...causal_lm_tester import CausalLMModelTest, CausalLMModelTester
 
 
 if is_torch_available():
-    from transformers import AutoTokenizer, Glm4MoeForCausalLM, Glm4MoeModel
+    from transformers import AutoTokenizer, Glm4MoeConfig, Glm4MoeForCausalLM, Glm4MoeModel
 
 
 class Glm4MoeModelTester(CausalLMModelTester):
@@ -60,6 +60,41 @@ class Glm4MoeModelTest(CausalLMModelTest, unittest.TestCase):
     # used in `test_torch_compile_for_training`. Skip as "Dynamic control flow in MoE"
     _torch_compile_train_cls = None
     model_split_percents = [0.5, 0.85, 0.9]  # it tries to offload everything with the default value
+
+    def test_mtp_forward_outputs_and_loss(self):
+        config = Glm4MoeConfig(
+            vocab_size=99,
+            hidden_size=32,
+            intermediate_size=64,
+            moe_intermediate_size=16,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            n_routed_experts=8,
+            num_experts_per_tok=2,
+            n_group=1,
+            topk_group=1,
+            num_nextn_predict_layers=1,
+            mtp_lambda_weight=0.3,
+            bos_token_id=1,
+            eos_token_id=2,
+            pad_token_id=0,
+        )
+        model = Glm4MoeForCausalLM(config).to(torch_device)
+        model.eval()
+
+        batch_size = 2
+        seq_length = 7
+        input_ids = torch.randint(low=0, high=config.vocab_size, size=(batch_size, seq_length), device=torch_device)
+        labels = input_ids.clone()
+
+        outputs = model(input_ids=input_ids, labels=labels, output_mtp_logits=True)
+
+        self.assertIsNotNone(outputs.loss)
+        self.assertIsNotNone(outputs.mtp_logits)
+        self.assertEqual(len(outputs.mtp_logits), 1)
+        self.assertEqual(outputs.logits.shape, (batch_size, seq_length, config.vocab_size))
+        self.assertEqual(outputs.mtp_logits[0].shape, (batch_size, seq_length - 1, config.vocab_size))
 
 
 @require_torch_accelerator

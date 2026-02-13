@@ -17,7 +17,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from ...configuration_utils import PreTrainedConfig
 from ...modeling_rope_utils import RopeParameters
 
@@ -90,6 +89,10 @@ class Glm4MoeConfig(PreTrainedConfig):
         first_k_dense_replace (`int`, *optional*, defaults to 1):
             Number of dense layers in shallow layers(embed->dense->dense->...->dense->moe->moe...->lm_head).
                                                             \--k dense layers--/
+        num_nextn_predict_layers (`int`, *optional*, defaults to 1):
+            Number of MTP layers stacked after the base decoder.
+        mtp_lambda_weight (`float`, *optional*, defaults to 0.3):
+            Weight used for MTP loss during training.
         norm_topk_prob (`bool`, *optional*, defaults to `True`):
             Whether to normalize the topk probabilities.
         use_qk_norm (`bool`, *optional*, defaults to `False`):
@@ -163,6 +166,8 @@ class Glm4MoeConfig(PreTrainedConfig):
         n_group: int | None = 1,
         topk_group: int | None = 1,
         first_k_dense_replace: int | None = 1,
+        num_nextn_predict_layers: int | None = 1,
+        mtp_lambda_weight: float | None = 0.3,
         norm_topk_prob: bool | None = True,
         use_qk_norm: bool | None = False,
         bos_token_id: int | None = None,
@@ -196,6 +201,8 @@ class Glm4MoeConfig(PreTrainedConfig):
         self.n_routed_experts = n_routed_experts
         self.routed_scaling_factor = routed_scaling_factor
         self.first_k_dense_replace = first_k_dense_replace
+        self.num_nextn_predict_layers = num_nextn_predict_layers
+        self.mtp_lambda_weight = mtp_lambda_weight
         self.norm_topk_prob = norm_topk_prob
         self.use_qk_norm = use_qk_norm
         self.tie_word_embeddings = tie_word_embeddings
